@@ -10,3 +10,4 @@ Repositório oficial com o pipeline completo para treino e avaliação do modelo
 - `colab_phase0_smoke_test.py`: Smoke Test de viabilidade e Gate G0.
 - `colab_phase1_train.py`: Loop de treinamento SFT com QLoRA NF4 e early stopping.
 - `evaluate_sophia_36b_gauntlet.py`: Avaliador com diretriz estrita de geração livre (`max_new_tokens >= 4096`).
+

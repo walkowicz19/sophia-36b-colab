@@ -8,16 +8,18 @@ Principais Funcionalidades:
 4. Adaptador LoRA em atenção e MLPs densos (r=16, alpha=32).
 5. Resiliência a desconexões efêmeras do Colab: salvamento periódico e retomada automática.
 6. Early stopping baseado em plateau de validation loss.
+7. Compatibilidade nativa com os templates de pensamento do K2-Horizon (think / reasoning).
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -36,6 +38,26 @@ def parse_args():
     parser.add_argument("--eval-steps", type=int, default=250, help="Intervalo de avaliação")
     parser.add_argument("--resume-from-checkpoint", type=str, default="auto", help="'auto' ou caminho específico")
     return parser.parse_args()
+
+def prepare_messages_for_k2(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Garante que toda mensagem do assistant possua o campo think esperado pelo tokenizer do K2 Horizon."""
+    prepared = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            m = dict(msg)
+            content = m.get("content", "") or ""
+            # Se já possui campo de thinking nativo, preserva
+            if not any(k in m for k in ("think", "reasoning", "reasoning_content", "think_fast", "think_faster")):
+                think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+                if think_match:
+                    m["think"] = think_match.group(1).strip()
+                    m["content"] = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).lstrip()
+                else:
+                    m["think"] = ""
+            prepared.append(m)
+        else:
+            prepared.append(msg)
+    return prepared
 
 def train():
     args = parse_args()
@@ -56,6 +78,7 @@ def train():
             BitsAndBytesConfig,
             TrainingArguments,
             Trainer,
+            DataCollatorForSeq2Seq,
             EarlyStoppingCallback
         )
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -94,7 +117,7 @@ def train():
         trust_remote_code=True
     )
     
-    # Prepara modelo para k-bit training
+    # Prepara modelo para k-bit training com checkpointing de gradiente
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     # 4. Configuração PEFT LoRA
@@ -116,10 +139,25 @@ def train():
     def format_batch(batch):
         formatted_texts = []
         for msgs in batch["messages"]:
-            text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+            try:
+                prep = prepare_messages_for_k2(msgs)
+                text = tokenizer.apply_chat_template(prep, tokenize=False, add_generation_prompt=False)
+            except Exception:
+                # Fallback seguro estruturado
+                text = ""
+                for m in msgs:
+                    role = m.get("role", "user")
+                    content = m.get("content", "")
+                    text += f"<|ifm|im_start|>{role}\n{content}<|ifm|im_end|>\n"
             formatted_texts.append(text)
-        tokenized = tokenizer(formatted_texts, max_length=args.max_seq_length, truncation=True, padding=False)
-        tokenized["labels"] = tokenized["input_ids"].copy()
+
+        tokenized = tokenizer(
+            formatted_texts,
+            max_length=args.max_seq_length,
+            truncation=True,
+            padding=False
+        )
+        tokenized["labels"] = [ids.copy() for ids in tokenized["input_ids"]]
         return tokenized
 
     logging.info("Tokenizando amostras com ChatML e truncamento dinâmico...")
@@ -149,6 +187,7 @@ def train():
         warmup_ratio=0.03,
         weight_decay=0.01,
         bf16=True,
+        gradient_checkpointing=True,
         logging_steps=10,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
@@ -161,11 +200,19 @@ def train():
         report_to="none"
     )
 
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        pad_to_multiple_of=8,
+        padding=True,
+        return_tensors="pt"
+    )
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_train,
         eval_dataset=tokenized_eval,
+        data_collator=data_collator,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
