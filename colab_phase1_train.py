@@ -137,6 +137,12 @@ def train():
     logging.info(f"Carregando dataset de treino: {args.dataset_path}...")
     dataset = load_dataset("json", data_files={"train": args.dataset_path, "eval": args.eval_dataset_path})
 
+    # Anti-vazamento: remove do treino qualquer exemplo presente no eval e amostra 400 para eval
+    eval_ids = set(dataset["eval"]["id"])
+    dataset["train"] = dataset["train"].filter(lambda x: x["id"] not in eval_ids)
+    dataset["eval"] = dataset["eval"].shuffle(seed=42).select(range(min(400, len(dataset["eval"]))))
+    logging.info(f"Treino limpo: {len(dataset['train'])} | Validacao (holdout): {len(dataset['eval'])}")
+
     def format_batch(batch):
         formatted_texts = []
         for msgs in batch["messages"]:
