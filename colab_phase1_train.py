@@ -195,7 +195,7 @@ def train():
         weight_decay=0.01,
         bf16=True,
         gradient_checkpointing=True,
-        group_by_length=True,
+        train_sampling_strategy="group_by_length",
         dataloader_num_workers=2,
         logging_steps=1,
         eval_strategy="steps",
