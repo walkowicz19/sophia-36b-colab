@@ -30,12 +30,12 @@ def parse_args():
     parser.add_argument("--eval-dataset-path", type=str, default="data/sophia-36b-seed-5k.jsonl.gz", help="Dataset de avaliação/validação")
     parser.add_argument("--output-dir", type=str, default="./sophia-36b-checkpoints", help="Diretório de checkpoints locais")
     parser.add_argument("--hf-repo-id", type=str, default="walkowicz19/sophia-36b-adapter", help="Repositório HF Hub para push de checkpoints")
-    parser.add_argument("--max-seq-length", type=int, default=16384, help="Comprimento máximo de contexto (16k–32k)")
-    parser.add_argument("--batch-size", type=int, default=2, help="Micro-batch size por GPU")
-    parser.add_argument("--grad-accum", type=int, default=4, help="Passos de acumulação de gradientes")
+    parser.add_argument("--max-seq-length", type=int, default=4096, help="Comprimento maximo de contexto")
+    parser.add_argument("--batch-size", type=int, default=4, help="Micro-batch size por GPU")
+    parser.add_argument("--grad-accum", type=int, default=2, help="Passos de acumulacao de gradientes (Batch efetivo 8)")
     parser.add_argument("--lr", type=float, default=2e-4, help="Taxa de aprendizado inicial")
-    parser.add_argument("--save-steps", type=int, default=250, help="Intervalo de salvamento de checkpoint")
-    parser.add_argument("--eval-steps", type=int, default=250, help="Intervalo de avaliação")
+    parser.add_argument("--save-steps", type=int, default=25, help="Intervalo de salvamento de checkpoint")
+    parser.add_argument("--eval-steps", type=int, default=25, help="Intervalo de avaliacao")
     parser.add_argument("--resume-from-checkpoint", type=str, default="auto", help="'auto' ou caminho específico")
     return parser.parse_args()
 
@@ -191,16 +191,18 @@ def train():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_steps=100,
+        warmup_steps=30,
         weight_decay=0.01,
         bf16=True,
         gradient_checkpointing=True,
-        logging_steps=10,
+        group_by_length=True,
+        dataloader_num_workers=2,
+        logging_steps=1,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
-        save_total_limit=3,
+        save_total_limit=5,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
