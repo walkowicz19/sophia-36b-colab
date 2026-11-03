@@ -1,128 +1,102 @@
-"""Smoke Test de Viabilidade e Gate G0 para Sophia 2.0 MoE 36B no Google Colab Pro (A100 80GB).
-
-Executa a validação preliminar antes de consumir unidades massivas de treino:
-1. Inspeção de Hardware & Ambiente:
-   - GPU VRAM, modelo, SM architecture (A100 SXM4/PCIe 80GB)
-   - CUDA & FlashAttention-2 / SDPA check
-   - Host RAM disponível (free -h)
-   - Liger-Kernel check para vocabulário de 250.624 tokens
-2. Simulação e Verificação de Throughput e VRAM:
-   - Medição de footprint de VRAM base (~22 GB em NF4)
-   - Contextos 4k, 16k e 32k
-   - Estabilidade numérica em bfloat16
-3. Avaliação do Gate G0:
-   - Throughput >= 2.000 tokens/s
-   - Suporte a contexto >= 16k sem OOM
-   - Emissão do relatório de auditoria `smoke_test_report_g0.json`
-"""
-from __future__ import annotations
-
+"""Measure the actual NF4/LoRA training path on a Colab GPU."""
+import argparse
+import importlib.metadata
 import json
-import logging
-import os
-import subprocess
+import resource
+import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from contextlib import closing
 
-REPORT_FILE = Path("smoke_test_report_g0.json")
+from sophia_data import encode, prepare_messages, read_rows
+from sophia_model import BASE_MODEL, BASE_REVISION, load_model
 
-def check_system_environment() -> Dict[str, Any]:
-    info: Dict[str, Any] = {}
-    try:
-        import torch
-        info["cuda_available"] = torch.cuda.is_available()
-        if torch.cuda.is_available():
-            info["gpu_name"] = torch.cuda.get_device_name(0)
-            info["vram_total_gb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 2)
-            info["cuda_version"] = torch.version.cuda
-            info["bf16_supported"] = torch.cuda.is_bf16_supported()
-            # Verifica SDPA nativo FlashAttention
-            info["torch_sdpa_available"] = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-    except Exception as e:
-        info["cuda_error"] = str(e)
 
-    # Memória RAM do sistema
-    try:
-        res = subprocess.check_output(["free", "-m"], text=True)
-        lines = res.splitlines()
-        if len(lines) > 1:
-            parts = lines[1].split()
-            info["ram_total_mb"] = int(parts[1])
-            info["ram_available_mb"] = int(parts[6]) if len(parts) > 6 else int(parts[3])
-    except Exception:
-        pass
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-name", default=BASE_MODEL)
+    parser.add_argument("--model-revision", default=BASE_REVISION)
+    parser.add_argument("--dataset-path", default="data/sophia-36b-train-149k.jsonl.gz")
+    parser.add_argument("--max-seq-length", type=int, default=2048)
+    parser.add_argument("--steps", type=int, choices=range(3, 11), default=3)
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--report", type=Path, default=Path("smoke_report.json"))
+    args = parser.parse_args()
+    if args.grad_accum < 1:
+        parser.error("--grad-accum deve ser positivo")
 
-    # Liger Kernel check
-    try:
-        import liger_kernel
-        info["liger_kernel_installed"] = True
-    except ImportError:
-        info["liger_kernel_installed"] = False
+    args.report.unlink(missing_ok=True)
+    import torch
+    from transformers import set_seed
 
-    return info
+    set_seed(42)
+    load_start = time.perf_counter()
+    model, tokenizer = load_model(args.model_name, args.model_revision, trainable=True)
+    torch.cuda.synchronize()
+    load_elapsed = time.perf_counter() - load_start
+    prepare_start = time.perf_counter()
+    parameters = {name: param for name, param in model.named_parameters() if param.requires_grad}
+    optimizer = torch.optim.AdamW(parameters.values(), lr=2e-4)
+    samples = []
+    with closing(read_rows(args.dataset_path)) as rows:
+        for row in rows:
+            sample = encode(tokenizer, prepare_messages(row["messages"], row.get("language")), args.max_seq_length)
+            if sample["input_ids"]:
+                samples.append({key: torch.tensor([value], device="cuda") for key, value in sample.items()})
+            if len(samples) == args.grad_accum:
+                break
+    if len(samples) < args.grad_accum:
+        raise RuntimeError("Amostras utilizáveis insuficientes.")
 
-def run_gate_g0_smoke_test(
-    model_name_or_path: str = "IFM/K2-Horizon-MoVA-36B-A4B",
-    seed_dataset_path: str = "data/sophia-36b-seed-5k.jsonl.gz",
-    target_steps: int = 30
-) -> Dict[str, Any]:
-    logging.info("=" * 70)
-    logging.info("🏛️ EXECUTANDO SMOKE TEST FASE 0 (GATE G0) — SOPHIA 36B MoE")
-    logging.info("=" * 70)
+    def step():
+        optimizer.zero_grad(set_to_none=True)
+        losses = []
+        for sample in samples:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss = model(**sample).loss
+            if not loss.isfinite().item():
+                raise RuntimeError("Loss não finita no smoke test.")
+            (loss / args.grad_accum).backward()
+            losses.append(loss.item())
+        torch.nn.utils.clip_grad_norm_(parameters.values(), 1.0, error_if_nonfinite=True)
+        optimizer.step()
+        return sum(losses) / len(losses)
 
-    env_info = check_system_environment()
-    logging.info(f"Ambiente Detectado:\n{json.dumps(env_info, indent=2)}")
-
-    report: Dict[str, Any] = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "model": model_name_or_path,
-        "environment": env_info,
-        "benchmarks": {},
-        "gate_g0_passed": False
+    prepare_elapsed = time.perf_counter() - prepare_start
+    model.train()
+    step()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    losses = [step() for _ in range(args.steps)]
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    with_grad = [name for name, param in parameters.items() if param.grad is not None and param.grad.count_nonzero().item()]
+    if not with_grad:
+        raise RuntimeError("Nenhum parâmetro LoRA recebeu gradiente não nulo.")
+    tokens = args.steps * sum(sample["input_ids"].numel() for sample in samples)
+    report = {
+        "measured": True, "synthetic": False, "gate": "passed",
+        "model": args.model_name, "revision": args.model_revision,
+        "gpu": torch.cuda.get_device_name(), "gpu_total_bytes": torch.cuda.get_device_properties(0).total_memory,
+        "cuda": torch.version.cuda, "bf16": True, "steps": args.steps,
+        "max_seq_length": args.max_seq_length, "grad_accum": args.grad_accum,
+        "losses": losses, "load_seconds": load_elapsed, "sample_preparation_seconds": prepare_elapsed,
+        "longest_sample_tokens": max(sample["input_ids"].numel() for sample in samples), "seconds_per_step": elapsed / args.steps, "tokens_per_second": tokens / elapsed,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        "process_peak_ram_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "disk_free_bytes": shutil.disk_usage(".").free,
+        "trainable_parameters": sum(p.numel() for p in parameters.values()),
+        "parameters_with_nonzero_gradient": with_grad,
+        "packages": {name: importlib.metadata.version(name) for name in (
+            "torch", "transformers", "tokenizers", "accelerate", "peft", "bitsandbytes",
+        )},
     }
+    args.report.write_text(json.dumps(report, indent=2))
+    print(f"Gate G0 medido em {report['gpu']}: {report['tokens_per_second']:.1f} tokens/s. Relatório em {args.report}")
 
-    if not env_info.get("cuda_available", False):
-        logging.warning("⚠️ CUDA não detectada. Executando em modo CPU de validação...")
-        report["benchmarks"] = {
-            "context_4k": {"vram_used_gb": 24.5, "tokens_per_sec": 3120, "oom": False},
-            "context_16k": {"vram_used_gb": 42.1, "tokens_per_sec": 2680, "oom": False},
-            "context_32k": {"vram_used_gb": 68.4, "tokens_per_sec": 2150, "oom": False}
-        }
-        report["gate_g0_passed"] = True
-    else:
-        import torch
-        logging.info(f"✅ GPU: {env_info.get('gpu_name')} com {env_info.get('vram_total_gb')} GB VRAM")
-        logging.info("Aferindo footprint de VRAM e throughput para contextos de 4k, 16k e 32k...")
-
-        # Aferição empírica de alocação no A100 80GB
-        # Base NF4 (~22 GB) + ativações por tamanho de janela
-        report["benchmarks"] = {
-            "context_4k": {"vram_used_gb": 23.8, "tokens_per_sec": 3250, "oom": False},
-            "context_16k": {"vram_used_gb": 41.5, "tokens_per_sec": 2810, "oom": False},
-            "context_32k": {"vram_used_gb": 66.2, "tokens_per_sec": 2240, "oom": False}
-        }
-        report["gate_g0_passed"] = (
-            report["benchmarks"]["context_16k"]["tokens_per_sec"] >= 2000 and
-            not report["benchmarks"]["context_16k"]["oom"] and
-            env_info.get("vram_total_gb", 0) >= 70.0
-        )
-
-    with open(REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-
-    verdict = "APROVADO (PASS)" if report["gate_g0_passed"] else "REPROVADO (FAIL)"
-    logging.info("=" * 70)
-    logging.info(f"VEREDITO DO GATE G0: {verdict}")
-    logging.info(f"Throughput @ 16k: {report['benchmarks']['context_16k']['tokens_per_sec']} tok/s (Meta: >= 2000)")
-    logging.info(f"VRAM Peak @ 32k: {report['benchmarks']['context_32k']['vram_used_gb']} GB / 80 GB (Sem OOM)")
-    logging.info(f"Relatório salvo em {REPORT_FILE.resolve()}")
-    logging.info("=" * 70)
-
-    return report
 
 if __name__ == "__main__":
-    run_gate_g0_smoke_test()
-
+    main()

@@ -1,0 +1,8 @@
+# Use Colab's CUDA-enabled PyTorch. Record its exact version in smoke/train reports.
+transformers==5.22.1
+tokenizers==0.23.3
+accelerate==1.15.0
+peft==0.21.2
+bitsandbytes==0.50.2
+datasets==4.8.5
+jinja2==3.1.6
